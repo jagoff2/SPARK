@@ -18,12 +18,30 @@ class CodebookSpec:
 
 
 class DemopackCodebook(torch.nn.Module):
-    def __init__(self, spec: CodebookSpec, init_scale: float = 0.02) -> None:
+    def __init__(
+        self,
+        spec: CodebookSpec,
+        init_scale: float = 0.02,
+        learnable: bool = False,
+    ) -> None:
         super().__init__()
         self.spec = spec
         codewords = torch.empty(spec.num_codewords, spec.embedding_dim)
         torch.nn.init.trunc_normal_(codewords, std=init_scale)
-        self.register_buffer("codewords", codewords)
+        if learnable:
+            self.codewords = torch.nn.Parameter(codewords)
+        else:
+            self.register_buffer("codewords", codewords)
+
+    def make_learnable(self) -> torch.nn.Parameter:
+        """Converts the underlying codebook into a trainable parameter."""
+
+        if isinstance(self.codewords, torch.nn.Parameter):
+            return self.codewords
+        codewords = torch.nn.Parameter(self.codewords.clone().detach())
+        self._buffers.pop("codewords")
+        self.register_parameter("codewords", codewords)
+        return self.codewords
 
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.dtype not in (torch.int16, torch.int32, torch.int64):

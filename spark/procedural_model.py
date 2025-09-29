@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .attention import AttentionBasisSynthesizer, AtomConfig, AttentionPatch
+
 from .data import (
     METADATA_DIM,
     DatasetStatistics,
@@ -15,6 +16,9 @@ from .data import (
     materialize_instructions,
 )
 from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder
+
+from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder, build_random_instructions
+
 from .hash_router import route_tokens_with_metadata
 from .kv_patcher import KVCachePatcher
 from .layer_generator import GeneratorConfig, LayerGenerator, apply_lora_delta
@@ -36,6 +40,16 @@ class ProceduralModelConfig:
     router_sparsity: float = 0.25
     router_num_neurons: int = 64
 
+    metadata_dim: int = 8
+    codebook_learnable: bool = False
+
+    attention_enabled: bool = True
+    routing_enabled: bool = True
+    kv_cache_enabled: bool = True
+    router_sparsity: float = 0.25
+    router_num_neurons: int = 64
+
+
 
 class ProceduralLanguageModel(torch.nn.Module):
     """Toy language model glueing together procedural components."""
@@ -43,6 +57,7 @@ class ProceduralLanguageModel(torch.nn.Module):
     def __init__(self, config: ProceduralModelConfig) -> None:
         super().__init__()
         self.config = config
+
         self.codebook = DemopackCodebook(config.codebook_spec)
         tile_rows = max(1, min(16, config.codebook_spec.embedding_dim))
         num_tiles = max(1, math.ceil(config.hidden_dim / tile_rows))
@@ -61,6 +76,15 @@ class ProceduralLanguageModel(torch.nn.Module):
         instructions = materialize_instructions(
             seed_set=self.instruction_seeds,
             num_layers=num_tiles,
+
+        self.codebook = DemopackCodebook(
+            config.codebook_spec, learnable=config.codebook_learnable
+        )
+        tile_rows = 16
+        num_tiles = max(1, config.hidden_dim // tile_rows)
+        instructions = build_random_instructions(
+            num_tiles=num_tiles,
+
             tile_shape=(tile_rows, config.input_dim),
             codebook_size=config.codebook_spec.num_codewords,
         )
@@ -70,7 +94,12 @@ class ProceduralLanguageModel(torch.nn.Module):
             in_features=config.input_dim,
             instructions=instructions,
         )
+
         self.generator = LayerGenerator(config.generator_config, metadata_dim=METADATA_DIM)
+
+        self.metadata_dim = config.metadata_dim
+        self.generator = LayerGenerator(config.generator_config, metadata_dim=self.metadata_dim)
+
         self.lm_head = torch.nn.Linear(num_tiles * tile_rows, config.vocab_size)
         self.token_proj = torch.nn.Linear(config.input_dim, config.hidden_dim)
         self.query_proj = torch.nn.Linear(config.hidden_dim, config.hidden_dim)
