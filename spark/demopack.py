@@ -80,9 +80,15 @@ class DemopackDecoder(torch.nn.Module):
             decoded = self.codebook(inst.codeword_indices)
             if decoded.size(-1) != self.in_features:
                 raise RuntimeError("Decoded tile width does not match in_features")
+            # Random instructions may request multiple codewords per output row.
+            # Aggregate along that middle dimension so each row contributes exactly
+            # one set of in_features activations before applying the rotation.
+            if decoded.ndim == 3:
+                decoded = decoded.mean(dim=1)
+            elif decoded.ndim != 2:
+                raise RuntimeError("Decoded tile must be rank-2 or rank-3")
             if inst.rotation is not None:
                 decoded = torch.matmul(decoded, inst.rotation)
-            decoded = decoded.reshape(-1, self.in_features)
             decoded_tiles.append(decoded * inst.scale)
         weight = torch.cat(decoded_tiles, dim=0)
         if weight.size(0) != self.out_features:
