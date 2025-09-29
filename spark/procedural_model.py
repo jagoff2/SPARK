@@ -2,12 +2,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional
 
 import torch
 
 from .attention import AttentionBasisSynthesizer, AtomConfig
-from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder, build_random_instructions
+from .data import (
+    METADATA_DIM,
+    DatasetStatistics,
+    InstructionSeedSet,
+    materialize_instructions,
+)
+from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder
 from .kv_patcher import KVCachePatcher
 from .layer_generator import GeneratorConfig, LayerGenerator, apply_lora_delta
 from .opcode_vm import Instruction, OpcodeVM
@@ -20,6 +26,8 @@ class ProceduralModelConfig:
     vocab_size: int
     codebook_spec: CodebookSpec
     generator_config: GeneratorConfig
+    dataset_statistics: Optional[DatasetStatistics] = None
+    instruction_seed_set: Optional[InstructionSeedSet] = None
 
 
 class ProceduralLanguageModel(torch.nn.Module):
@@ -31,8 +39,21 @@ class ProceduralLanguageModel(torch.nn.Module):
         self.codebook = DemopackCodebook(config.codebook_spec)
         tile_rows = 16
         num_tiles = max(1, config.hidden_dim // tile_rows)
-        instructions = build_random_instructions(
-            num_tiles=num_tiles,
+        self.dataset_statistics = config.dataset_statistics or DatasetStatistics.synthetic(
+            vocab_size=config.vocab_size,
+            sequence_length=config.input_dim,
+        )
+        if config.instruction_seed_set is not None:
+            self.instruction_seeds = config.instruction_seed_set
+            self.instruction_seeds.ensure_length(num_tiles)
+        else:
+            self.instruction_seeds = InstructionSeedSet.from_statistics(
+                self.dataset_statistics,
+                num_layers=num_tiles,
+            )
+        instructions = materialize_instructions(
+            seed_set=self.instruction_seeds,
+            num_layers=num_tiles,
             tile_shape=(tile_rows, config.input_dim),
             codebook_size=config.codebook_spec.num_codewords,
         )
@@ -42,7 +63,7 @@ class ProceduralLanguageModel(torch.nn.Module):
             in_features=config.input_dim,
             instructions=instructions,
         )
-        self.generator = LayerGenerator(config.generator_config, metadata_dim=8)
+        self.generator = LayerGenerator(config.generator_config, metadata_dim=METADATA_DIM)
         self.lm_head = torch.nn.Linear(num_tiles * tile_rows, config.vocab_size)
         atom_cfgs = [
             AtomConfig(name="sin", frequency=freq) for freq in (1.0, 2.0, 4.0)
