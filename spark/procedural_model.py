@@ -1,6 +1,7 @@
 """High-level integration of SPARK procedural components."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import List, Optional
 
@@ -37,8 +38,8 @@ class ProceduralLanguageModel(torch.nn.Module):
         super().__init__()
         self.config = config
         self.codebook = DemopackCodebook(config.codebook_spec)
-        tile_rows = 16
-        num_tiles = max(1, config.hidden_dim // tile_rows)
+        tile_rows = max(1, min(16, config.codebook_spec.embedding_dim))
+        num_tiles = max(1, math.ceil(config.hidden_dim / tile_rows))
         self.dataset_statistics = config.dataset_statistics or DatasetStatistics.synthetic(
             vocab_size=config.vocab_size,
             sequence_length=config.input_dim,
