@@ -8,7 +8,6 @@ from typing import Dict, List, Optional, Tuple
 import torch
 
 from .attention import AttentionBasisSynthesizer, AtomConfig, AttentionPatch
-
 from .data import (
     METADATA_DIM,
     DatasetStatistics,
@@ -16,9 +15,6 @@ from .data import (
     materialize_instructions,
 )
 from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder
-
-from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder, build_random_instructions
-
 from .hash_router import route_tokens_with_metadata
 from .kv_patcher import KVCachePatcher
 from .layer_generator import GeneratorConfig, LayerGenerator, apply_lora_delta
@@ -27,6 +23,8 @@ from .opcode_vm import Instruction, OpcodeVM
 
 @dataclass
 class ProceduralModelConfig:
+    """Configuration bundle for :class:`ProceduralLanguageModel`."""
+
     input_dim: int
     hidden_dim: int
     vocab_size: int
@@ -39,16 +37,8 @@ class ProceduralModelConfig:
     kv_cache_enabled: bool = True
     router_sparsity: float = 0.25
     router_num_neurons: int = 64
-
-    metadata_dim: int = 8
+    metadata_dim: int = METADATA_DIM
     codebook_learnable: bool = False
-
-    attention_enabled: bool = True
-    routing_enabled: bool = True
-    kv_cache_enabled: bool = True
-    router_sparsity: float = 0.25
-    router_num_neurons: int = 64
-
 
 
 class ProceduralLanguageModel(torch.nn.Module):
@@ -58,13 +48,26 @@ class ProceduralLanguageModel(torch.nn.Module):
         super().__init__()
         self.config = config
 
-        self.codebook = DemopackCodebook(config.codebook_spec)
-        tile_rows = max(1, min(16, config.codebook_spec.embedding_dim))
-        num_tiles = max(1, math.ceil(config.hidden_dim / tile_rows))
-        self.dataset_statistics = config.dataset_statistics or DatasetStatistics.synthetic(
-            vocab_size=config.vocab_size,
-            sequence_length=config.input_dim,
+        self.codebook = DemopackCodebook(
+            config.codebook_spec, learnable=config.codebook_learnable
         )
+
+        # Determine tiling so that the decoder output matches ``hidden_dim``.
+        max_rows = max(1, min(config.codebook_spec.embedding_dim, config.hidden_dim))
+        tile_rows = math.gcd(config.hidden_dim, max_rows)
+        if tile_rows == 0:
+            tile_rows = 1
+        num_tiles = max(1, config.hidden_dim // tile_rows)
+
+        # Prepare statistics and instruction seeds.
+        if config.dataset_statistics is not None:
+            self.dataset_statistics = config.dataset_statistics
+        else:
+            self.dataset_statistics = DatasetStatistics.synthetic(
+                vocab_size=config.vocab_size,
+                sequence_length=config.input_dim,
+            )
+
         if config.instruction_seed_set is not None:
             self.instruction_seeds = config.instruction_seed_set
             self.instruction_seeds.ensure_length(num_tiles)
@@ -73,39 +76,31 @@ class ProceduralLanguageModel(torch.nn.Module):
                 self.dataset_statistics,
                 num_layers=num_tiles,
             )
+
         instructions = materialize_instructions(
             seed_set=self.instruction_seeds,
             num_layers=num_tiles,
-
-        self.codebook = DemopackCodebook(
-            config.codebook_spec, learnable=config.codebook_learnable
-        )
-        tile_rows = 16
-        num_tiles = max(1, config.hidden_dim // tile_rows)
-        instructions = build_random_instructions(
-            num_tiles=num_tiles,
-
             tile_shape=(tile_rows, config.input_dim),
             codebook_size=config.codebook_spec.num_codewords,
         )
+
         self.decoder = DemopackDecoder(
             codebook=self.codebook,
-            out_features=num_tiles * tile_rows,
+            out_features=config.hidden_dim,
             in_features=config.input_dim,
             instructions=instructions,
         )
 
-        self.generator = LayerGenerator(config.generator_config, metadata_dim=METADATA_DIM)
-
         self.metadata_dim = config.metadata_dim
         self.generator = LayerGenerator(config.generator_config, metadata_dim=self.metadata_dim)
 
-        self.lm_head = torch.nn.Linear(num_tiles * tile_rows, config.vocab_size)
+        self.lm_head = torch.nn.Linear(config.hidden_dim, config.vocab_size)
         self.token_proj = torch.nn.Linear(config.input_dim, config.hidden_dim)
         self.query_proj = torch.nn.Linear(config.hidden_dim, config.hidden_dim)
         self.key_proj = torch.nn.Linear(config.hidden_dim, config.hidden_dim)
         self.value_proj = torch.nn.Linear(config.hidden_dim, config.hidden_dim)
         self.attn_output_proj = torch.nn.Linear(config.hidden_dim, config.input_dim)
+
         atom_cfgs = [
             AtomConfig(name="sin", frequency=freq) for freq in (1.0, 2.0, 4.0)
         ] + [
@@ -173,7 +168,8 @@ class ProceduralLanguageModel(torch.nn.Module):
                 combined = attn_out.squeeze(1)
                 routing_metadata.append(None)
 
-            decoder_inputs.append(self.attn_output_proj(combined))
+            projected = self.attn_output_proj(combined)
+            decoder_inputs.append(projected)
 
         if self.config.kv_cache_enabled:
             self.kv_patcher.sweep()
@@ -187,6 +183,11 @@ class ProceduralLanguageModel(torch.nn.Module):
         return logits
 
     def apply_generator_delta(self, metadata: torch.Tensor) -> None:
+        if metadata.ndim == 1:
+            metadata = metadata.unsqueeze(0)
+        elif metadata.ndim != 2:
+            raise ValueError("Metadata tensor must be rank-1 or rank-2")
+
         base = self.lm_head.weight.data.clone()
         delta = self.generator(metadata, base.size(1), base.size(0))
         updated = apply_lora_delta(base, delta)
