@@ -20,6 +20,8 @@ class ProceduralModelConfig:
     vocab_size: int
     codebook_spec: CodebookSpec
     generator_config: GeneratorConfig
+    metadata_dim: int = 8
+    codebook_learnable: bool = False
 
 
 class ProceduralLanguageModel(torch.nn.Module):
@@ -28,7 +30,9 @@ class ProceduralLanguageModel(torch.nn.Module):
     def __init__(self, config: ProceduralModelConfig) -> None:
         super().__init__()
         self.config = config
-        self.codebook = DemopackCodebook(config.codebook_spec)
+        self.codebook = DemopackCodebook(
+            config.codebook_spec, learnable=config.codebook_learnable
+        )
         tile_rows = 16
         num_tiles = max(1, config.hidden_dim // tile_rows)
         instructions = build_random_instructions(
@@ -42,7 +46,8 @@ class ProceduralLanguageModel(torch.nn.Module):
             in_features=config.input_dim,
             instructions=instructions,
         )
-        self.generator = LayerGenerator(config.generator_config, metadata_dim=8)
+        self.metadata_dim = config.metadata_dim
+        self.generator = LayerGenerator(config.generator_config, metadata_dim=self.metadata_dim)
         self.lm_head = torch.nn.Linear(num_tiles * tile_rows, config.vocab_size)
         atom_cfgs = [
             AtomConfig(name="sin", frequency=freq) for freq in (1.0, 2.0, 4.0)
