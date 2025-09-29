@@ -87,3 +87,41 @@ Future work will focus on replacing the PyTorch reference implementations with
 custom CUDA 12.8 kernels, integrating Triton-based fused decode kernels, and
 adding dataset synthesis pipelines that emit procedural seeds instead of static
 examples.
+
+## Evaluation
+
+The `spark.evaluation` module contains utilities for benchmarking the procedural
+model against dense baselines.  It exposes helpers to build a comparable dense
+network, measure perplexity, estimate throughput, and approximate the parameter
+footprint so results can be compared under identical conditions.  Example usage:
+
+```python
+from spark.demopack import CodebookSpec
+from spark.evaluation import (
+    EvaluationBatch,
+    build_dense_baseline,
+    compare_models,
+)
+from spark.layer_generator import GeneratorConfig
+from spark.procedural_model import ProceduralLanguageModel, ProceduralModelConfig
+import torch
+
+config = ProceduralModelConfig(
+    input_dim=32,
+    hidden_dim=64,
+    vocab_size=512,
+    codebook_spec=CodebookSpec(num_codewords=64, embedding_dim=32),
+    generator_config=GeneratorConfig(embed_dim=16, hidden_dim=32, rank=4),
+)
+procedural = ProceduralLanguageModel(config)
+dense = build_dense_baseline(config)
+
+inputs = torch.randn(8, 32)
+targets = torch.randint(0, config.vocab_size, (8,))
+batch = EvaluationBatch(inputs=inputs, targets=targets)
+report = compare_models(procedural, dense, batch)
+print(report)
+```
+
+Additional helpers demonstrate qualitative advantages such as opcode reasoning
+traces and KV-cache reuse timings once quantitative metrics are established.
