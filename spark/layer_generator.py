@@ -23,6 +23,7 @@ class LayerGenerator(torch.nn.Module):
     def __init__(self, config: GeneratorConfig, metadata_dim: int) -> None:
         super().__init__()
         self.config = config
+        self.metadata_dim = metadata_dim
         layers = [torch.nn.Linear(metadata_dim, config.embed_dim), torch.nn.GELU()]
         for _ in range(config.num_layers - 1):
             layers.append(torch.nn.Linear(config.embed_dim, config.embed_dim))
