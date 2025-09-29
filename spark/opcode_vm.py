@@ -78,6 +78,19 @@ class OpcodeVM:
         return state
 
     def _handle_plan(self, state: ExecutionState, argument: Optional[str]) -> None:
+        """Register a plan and make it available for subsequent opcodes.
+
+        The ``PLAN`` opcode typically sets up a hypothesis that later
+        instructions (like ``CHECK``) will validate.  The previous
+        implementation only logged the plan without storing it which meant
+        that any immediate ``CHECK`` would operate on an empty stack and raise
+        a ``VMError``.  By pushing the argument onto the stack we retain the
+        planned hypothesis for later use while keeping the logging behaviour
+        unchanged.
+        """
+
+        if argument is not None:
+            state.push(argument)
         state.log.append(f"PLAN: {argument or 'no-op'}")
 
     def _handle_retr(self, state: ExecutionState, argument: Optional[str]) -> None:
@@ -97,7 +110,12 @@ class OpcodeVM:
         state.push(argument or "")
 
     def _handle_check(self, state: ExecutionState, argument: Optional[str]) -> None:
-        hypothesis = state.pop()
+        if state.stack:
+            hypothesis = state.pop()
+        elif argument is not None:
+            hypothesis = argument
+        else:
+            raise VMError("No hypothesis available for CHECK")
         state.log.append(f"CHECK: {hypothesis}")
 
     def _handle_branch(self, state: ExecutionState, argument: Optional[str]) -> None:
