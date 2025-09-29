@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 
@@ -150,10 +150,57 @@ def build_random_instructions(
     return instructions
 
 
+def serialize_instruction(instruction: DecodeInstruction) -> dict:
+    """Serialize a single :class:`DecodeInstruction` into a portable dict."""
+
+    payload = {
+        "codeword_indices": instruction.codeword_indices.detach().cpu().tolist(),
+        "scale": float(instruction.scale),
+        "rotation": None,
+    }
+    if instruction.rotation is not None:
+        payload["rotation"] = instruction.rotation.detach().cpu().tolist()
+    return payload
+
+
+def deserialize_instruction(payload: dict, device: Optional[torch.device] = None) -> DecodeInstruction:
+    """Reconstruct a :class:`DecodeInstruction` from serialized data."""
+
+    indices = torch.tensor(payload["codeword_indices"], dtype=torch.int32, device=device)
+    rotation = payload.get("rotation")
+    rotation_tensor = None
+    if rotation is not None:
+        rotation_tensor = torch.tensor(rotation, dtype=torch.float32, device=device)
+    return DecodeInstruction(
+        codeword_indices=indices,
+        scale=float(payload.get("scale", 1.0)),
+        rotation=rotation_tensor,
+    )
+
+
+def serialize_instruction_set(instructions: Sequence[DecodeInstruction]) -> List[dict]:
+    """Serialize a sequence of instructions for persistence."""
+
+    return [serialize_instruction(inst) for inst in instructions]
+
+
+def deserialize_instruction_set(
+    payload: Sequence[dict],
+    device: Optional[torch.device] = None,
+) -> List[DecodeInstruction]:
+    """Inverse of :func:`serialize_instruction_set`."""
+
+    return [deserialize_instruction(item, device=device) for item in payload]
+
+
 __all__ = [
     "CodebookSpec",
     "DemopackCodebook",
     "DemopackDecoder",
     "DecodeInstruction",
     "build_random_instructions",
+    "serialize_instruction",
+    "deserialize_instruction",
+    "serialize_instruction_set",
+    "deserialize_instruction_set",
 ]

@@ -1,13 +1,24 @@
 """High-level integration of SPARK procedural components."""
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
 
 from .attention import AttentionBasisSynthesizer, AtomConfig, AttentionPatch
+
+from .data import (
+    METADATA_DIM,
+    DatasetStatistics,
+    InstructionSeedSet,
+    materialize_instructions,
+)
+from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder
+
 from .demopack import CodebookSpec, DemopackCodebook, DemopackDecoder, build_random_instructions
+
 from .hash_router import route_tokens_with_metadata
 from .kv_patcher import KVCachePatcher
 from .layer_generator import GeneratorConfig, LayerGenerator, apply_lora_delta
@@ -21,6 +32,13 @@ class ProceduralModelConfig:
     vocab_size: int
     codebook_spec: CodebookSpec
     generator_config: GeneratorConfig
+    dataset_statistics: Optional[DatasetStatistics] = None
+    instruction_seed_set: Optional[InstructionSeedSet] = None
+    attention_enabled: bool = True
+    routing_enabled: bool = True
+    kv_cache_enabled: bool = True
+    router_sparsity: float = 0.25
+    router_num_neurons: int = 64
 
     metadata_dim: int = 8
     codebook_learnable: bool = False
@@ -39,6 +57,26 @@ class ProceduralLanguageModel(torch.nn.Module):
     def __init__(self, config: ProceduralModelConfig) -> None:
         super().__init__()
         self.config = config
+
+        self.codebook = DemopackCodebook(config.codebook_spec)
+        tile_rows = max(1, min(16, config.codebook_spec.embedding_dim))
+        num_tiles = max(1, math.ceil(config.hidden_dim / tile_rows))
+        self.dataset_statistics = config.dataset_statistics or DatasetStatistics.synthetic(
+            vocab_size=config.vocab_size,
+            sequence_length=config.input_dim,
+        )
+        if config.instruction_seed_set is not None:
+            self.instruction_seeds = config.instruction_seed_set
+            self.instruction_seeds.ensure_length(num_tiles)
+        else:
+            self.instruction_seeds = InstructionSeedSet.from_statistics(
+                self.dataset_statistics,
+                num_layers=num_tiles,
+            )
+        instructions = materialize_instructions(
+            seed_set=self.instruction_seeds,
+            num_layers=num_tiles,
+
         self.codebook = DemopackCodebook(
             config.codebook_spec, learnable=config.codebook_learnable
         )
@@ -46,6 +84,7 @@ class ProceduralLanguageModel(torch.nn.Module):
         num_tiles = max(1, config.hidden_dim // tile_rows)
         instructions = build_random_instructions(
             num_tiles=num_tiles,
+
             tile_shape=(tile_rows, config.input_dim),
             codebook_size=config.codebook_spec.num_codewords,
         )
@@ -55,8 +94,12 @@ class ProceduralLanguageModel(torch.nn.Module):
             in_features=config.input_dim,
             instructions=instructions,
         )
+
+        self.generator = LayerGenerator(config.generator_config, metadata_dim=METADATA_DIM)
+
         self.metadata_dim = config.metadata_dim
         self.generator = LayerGenerator(config.generator_config, metadata_dim=self.metadata_dim)
+
         self.lm_head = torch.nn.Linear(num_tiles * tile_rows, config.vocab_size)
         self.token_proj = torch.nn.Linear(config.input_dim, config.hidden_dim)
         self.query_proj = torch.nn.Linear(config.hidden_dim, config.hidden_dim)
