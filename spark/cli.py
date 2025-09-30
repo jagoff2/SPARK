@@ -33,6 +33,7 @@ from .layer_generator import GeneratorConfig
 from .opcode_vm import Instruction, Opcode
 from .procedural_model import ProceduralLanguageModel, ProceduralModelConfig
 from .training import TrainingConfig, TrainingEpochReport, run_training
+from .training.pipeline import build_frontier_training_plan, materialize_plan
 
 
 # ---------------------------------------------------------------------------
@@ -300,19 +301,36 @@ def run_chat_command(args: argparse.Namespace) -> int:
     device = _device_from_args(args.device)
     _set_seed(args.seed, device)
 
-    cfg = ModelCLIConfig(
-        input_dim=args.input_dim,
-        hidden_dim=args.hidden_dim,
-        vocab_size=args.vocab_size,
-        codebook_size=args.codebook_size,
-        generator_embed_dim=args.generator_embed_dim,
-        generator_hidden_dim=args.generator_hidden_dim,
-        generator_rank=args.generator_rank,
-        metadata_dim=args.metadata_dim,
-        codebook_learnable=args.codebook_learnable,
-    )
+    checkpoint_cfg: TrainingConfig | None = None
+    checkpoint_payload: dict | None = None
+    if getattr(args, "checkpoint", None):
+        checkpoint_payload = torch.load(args.checkpoint, map_location="cpu")
+        cfg_dict = checkpoint_payload.get("config")
+        if cfg_dict is not None:
+            checkpoint_cfg = TrainingConfig(**cfg_dict)
+
+    if checkpoint_cfg is not None:
+        cfg = _model_config_from_training(checkpoint_cfg)
+    else:
+        cfg = ModelCLIConfig(
+            input_dim=args.input_dim,
+            hidden_dim=args.hidden_dim,
+            vocab_size=args.vocab_size,
+            codebook_size=args.codebook_size,
+            generator_embed_dim=args.generator_embed_dim,
+            generator_hidden_dim=args.generator_hidden_dim,
+            generator_rank=args.generator_rank,
+            metadata_dim=args.metadata_dim,
+            codebook_learnable=args.codebook_learnable,
+        )
     model_cfg = _build_model_config(cfg)
-    model = ProceduralLanguageModel(model_cfg).to(device)
+    model = ProceduralLanguageModel(model_cfg)
+    if checkpoint_payload is not None:
+        state_dict = checkpoint_payload.get("model")
+        if state_dict is None:
+            raise ValueError("Checkpoint is missing model weights")
+        model.load_state_dict(state_dict)
+    model = model.to(device)
 
     print("SPARK chat interface – type /exit to quit.\n")
 
@@ -360,6 +378,30 @@ def run_chat_command(args: argparse.Namespace) -> int:
         turns += 1
 
     print("Session ended.")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# ``spark pipeline`` implementation
+
+
+def run_pipeline_command(args: argparse.Namespace) -> int:
+    output_dir = Path(args.output_dir)
+    plan = build_frontier_training_plan(output_dir, seed=args.seed, device=args.device)
+    payload = plan.to_dict()
+
+    if args.materialize_configs or args.emit_script:
+        assets = materialize_plan(
+            plan, output_dir=output_dir, emit_script=args.emit_script
+        )
+        payload["assets"] = assets
+
+    if args.output is not None:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(payload, indent=2))
+
+    print(json.dumps(payload, indent=2))
     return 0
 
 
@@ -438,6 +480,12 @@ def _build_parser() -> argparse.ArgumentParser:
     chat_parser.add_argument(
         "--max-turns", type=int, default=None, help="Maximum number of turns before exit"
     )
+    chat_parser.add_argument(
+        "--checkpoint",
+        type=str,
+        default=None,
+        help="Optional checkpoint produced by `spark train` to load into the chat demo",
+    )
     chat_parser.set_defaults(func=run_chat_command)
 
     training_defaults = TrainingConfig()
@@ -514,6 +562,42 @@ def _build_parser() -> argparse.ArgumentParser:
         help=f"Directory to store checkpoints (default: {training_defaults.checkpoint_dir})",
     )
     train_parser.set_defaults(func=run_train_command)
+
+    pipeline_parser = subparsers.add_parser(
+        "pipeline", help="Generate an automated frontier training plan"
+    )
+    pipeline_parser.add_argument(
+        "--output-dir",
+        type=str,
+        default="frontier_plan",
+        help="Directory used for emitted configs, logs, and checkpoints",
+    )
+    pipeline_parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="Optional JSON file containing the rendered training plan",
+    )
+    pipeline_parser.add_argument(
+        "--seed", type=int, default=42, help="Base random seed baked into phase configs"
+    )
+    pipeline_parser.add_argument(
+        "--device",
+        type=str,
+        default=None,
+        help="Optional device forwarded to generated CLI invocations",
+    )
+    pipeline_parser.add_argument(
+        "--materialize-configs",
+        action="store_true",
+        help="Write per-phase TrainingConfig JSON files to --output-dir",
+    )
+    pipeline_parser.add_argument(
+        "--emit-script",
+        action="store_true",
+        help="Emit a helper shell script that executes the full plan",
+    )
+    pipeline_parser.set_defaults(func=run_pipeline_command)
 
     return parser
 

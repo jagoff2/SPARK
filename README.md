@@ -146,3 +146,34 @@ print(report)
 
 Additional helpers demonstrate qualitative advantages such as opcode reasoning
 traces and KV-cache reuse timings once quantitative metrics are established.
+
+## Frontier-scale automation
+
+To produce an automated curriculum that drives the procedural model to frontier
+parity, the CLI exposes a ``pipeline`` helper.  It emits per-phase
+``TrainingConfig`` JSON files, the associated ``spark train`` invocations, and
+an optional shell script that can be run on orchestrated trainer nodes:
+
+```powershell
+python -m spark pipeline --output-dir frontier_plan --materialize-configs --emit-script
+```
+
+The generated ``frontier_plan`` directory contains:
+
+* `configs/` – phase-specific configurations consumed by ``spark train``.
+* `logs/` – suggested output destinations for JSON summaries.
+* `checkpoints/` – dedicated folders that daisy-chain checkpoints between
+  phases.
+* `run_frontier_plan.sh` – convenience script that executes the curriculum,
+  evaluation sweep, and chat verification back-to-back.
+
+After the preference-optimisation phase, launch the chat demo using the trained
+weights and checkpoint metadata embedded in the plan:
+
+```powershell
+python -m spark chat --checkpoint frontier_plan\checkpoints\04_preference_optimisation\last.pt --show-trace --top-k 10
+```
+
+The plan summary also lists resource targets (accelerators, dataset budgets,
+and evaluation criteria) so it can be integrated into monitoring dashboards or
+auto-schedulers without manual bookkeeping.
