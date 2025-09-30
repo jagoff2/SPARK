@@ -6,7 +6,7 @@ import contextlib
 import dataclasses
 import json
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Callable, Dict, List, Tuple
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -26,7 +26,7 @@ class TrainingConfig:
     codebook_size: int = 64
     codebook_learnable: bool = True
     metadata_dim: int = 8
-    generator_embed_dim: int = 16
+    generator_embed_dim: int = 128
     generator_hidden_dim: int = 32
     generator_rank: int = 4
     batch_size: int = 16
@@ -40,6 +40,16 @@ class TrainingConfig:
     use_amp: bool = True
     checkpoint_dir: str = "checkpoints"
     resume_from: str | None = None
+
+
+@dataclasses.dataclass
+class TrainingEpochReport:
+    """Lightweight summary for a single epoch."""
+
+    epoch: int
+    train_loss: float
+    eval_loss: float
+    global_step: int
 
 
 class SyntheticSequenceDataset(Dataset):
@@ -201,6 +211,10 @@ def run_epoch(
     original_weight = None
     if not train:
         original_weight = model.lm_head.weight.detach().clone()
+    base_weight = model.lm_head.weight
+    generator_embed = getattr(getattr(model.generator, "config", None), "embed_dim", base_weight.size(1))
+    supports_generator_delta = generator_embed >= base_weight.size(1) and generator_embed >= base_weight.size(0)
+    generator_warning_emitted = False
     def autocast_cm():
         if device.type == "cuda" and use_amp:
             return torch.cuda.amp.autocast(dtype=torch.float16)
@@ -215,7 +229,17 @@ def run_epoch(
             if train:
                 optimizer.zero_grad(set_to_none=True)
             with autocast_cm():
-                model.apply_generator_delta(metadata)
+                if supports_generator_delta:
+                    try:
+                        model.apply_generator_delta(metadata)
+                    except RuntimeError:
+                        supports_generator_delta = False
+                        if not generator_warning_emitted:
+                            print(
+                                "(Generator delta disabled after runtime mismatch during training.)",
+                                flush=True,
+                            )
+                            generator_warning_emitted = True
                 logits = model(inputs)
                 loss = torch.nn.functional.cross_entropy(logits, targets)
             if train:
@@ -233,50 +257,64 @@ def run_epoch(
     return mean_loss, total_batches
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--config", type=str, default=None, help="Path to a JSON config file")
-    parser.add_argument("--resume", type=str, default=None, help="Resume from a checkpoint path")
-    return parser.parse_args()
+def run_training(
+    cfg: TrainingConfig,
+    *,
+    device: torch.device | None = None,
+    progress_callback: Callable[[TrainingEpochReport], None] | None = None,
+) -> Dict[str, object]:
+    """Train the procedural model according to ``cfg``.
 
+    Parameters
+    ----------
+    cfg:
+        Dataclass describing the training experiment.
+    device:
+        Optional explicit device.  When omitted a CUDA device is selected when
+        available, otherwise CPU is used.
+    progress_callback:
+        Optional callable invoked after each epoch with a
+        :class:`TrainingEpochReport`.
 
-def load_config(path: str | None) -> TrainingConfig:
-    if path is None:
-        return TrainingConfig()
-    cfg_dict = json.loads(Path(path).read_text())
-    return TrainingConfig(**cfg_dict)
+    Returns
+    -------
+    Dict[str, object]
+        Dictionary containing the serialized configuration, device string,
+        checkpoint path (if any), and a history of epoch level metrics.
+    """
 
-
-def main() -> None:
-    args = parse_args()
-    cfg = load_config(args.config)
-    if args.resume:
-        cfg.resume_from = args.resume
+    cfg = dataclasses.replace(cfg)
     set_seed(cfg.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    if torch.cuda.is_available():
+    if device.type == "cuda":
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
+
     model = build_model(cfg, device)
     optimizer = configure_optimizer(model, cfg)
     scaler = torch.cuda.amp.GradScaler(enabled=cfg.use_amp and device.type == "cuda")
 
     start_epoch = 0
     global_step = 0
-    if cfg.resume_from:
-        epoch, step, saved_cfg = load_checkpoint(Path(cfg.resume_from), model, optimizer, scaler)
+    resume_path = cfg.resume_from
+    if resume_path:
+        epoch, step, saved_cfg = load_checkpoint(Path(resume_path), model, optimizer, scaler)
         cfg = saved_cfg
-        cfg.resume_from = args.resume
+        cfg.resume_from = resume_path
         start_epoch = epoch
         global_step = step
         set_seed(cfg.seed)
 
-    checkpoint_path = Path(cfg.checkpoint_dir) / "last.pt"
+    checkpoint_path: Path | None = None
+    if cfg.checkpoint_dir:
+        checkpoint_path = Path(cfg.checkpoint_dir) / "last.pt"
 
     train_loader, eval_loader = build_dataloaders(cfg)
 
+    history: List[TrainingEpochReport] = []
     for epoch in range(start_epoch, cfg.epochs):
         train_loss, num_batches = run_epoch(
             model,
@@ -299,11 +337,54 @@ def main() -> None:
             cfg.use_amp and device.type == "cuda",
             train=False,
         )
-        save_checkpoint(checkpoint_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+        if checkpoint_path is not None:
+            save_checkpoint(checkpoint_path, model, optimizer, scaler, epoch + 1, global_step, cfg)
+        report = TrainingEpochReport(
+            epoch=epoch + 1,
+            train_loss=train_loss,
+            eval_loss=eval_loss,
+            global_step=global_step,
+        )
+        history.append(report)
+        if progress_callback is not None:
+            progress_callback(report)
+
+    return {
+        "config": dataclasses.asdict(cfg),
+        "device": str(device),
+        "history": [dataclasses.asdict(r) for r in history],
+        "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
+    }
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=str, default=None, help="Path to a JSON config file")
+    parser.add_argument("--resume", type=str, default=None, help="Resume from a checkpoint path")
+    return parser.parse_args()
+
+
+def load_config(path: str | None) -> TrainingConfig:
+    if path is None:
+        return TrainingConfig()
+    cfg_dict = json.loads(Path(path).read_text())
+    return TrainingConfig(**cfg_dict)
+
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(args.config)
+    if args.resume:
+        cfg.resume_from = args.resume
+    total_epochs = cfg.epochs
+
+    def _log_progress(report: TrainingEpochReport) -> None:
         print(
-            f"Epoch {epoch + 1}/{cfg.epochs} - train_loss: {train_loss:.4f} - eval_loss: {eval_loss:.4f}",
+            f"Epoch {report.epoch}/{total_epochs} - train_loss: {report.train_loss:.4f} - eval_loss: {report.eval_loss:.4f}",
             flush=True,
         )
+
+    run_training(cfg, progress_callback=_log_progress)
 
 
 if __name__ == "__main__":  # pragma: no cover - manual entry point
