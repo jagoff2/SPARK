@@ -19,6 +19,7 @@ single script entry point which is especially useful for CI/CD jobs.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import math
 from dataclasses import dataclass
@@ -33,6 +34,7 @@ from .layer_generator import GeneratorConfig
 from .opcode_vm import Instruction, Opcode
 from .procedural_model import ProceduralLanguageModel, ProceduralModelConfig
 from .training import TrainingConfig, TrainingEpochReport, run_training
+from .training.train import build_model
 from .training.pipeline import build_frontier_training_plan, materialize_plan
 
 
@@ -53,6 +55,9 @@ class ModelCLIConfig:
     generator_rank: int
     metadata_dim: int
     codebook_learnable: bool
+    model_dtype: str = "auto"
+    codebook_dtype: str = "float32"
+    offload_codebook_to_cpu: bool = True
 
 
 def _build_model_config(cfg: ModelCLIConfig) -> ProceduralModelConfig:
@@ -84,6 +89,9 @@ def _model_config_from_training(cfg: TrainingConfig) -> ModelCLIConfig:
         generator_rank=cfg.generator_rank,
         metadata_dim=cfg.metadata_dim,
         codebook_learnable=cfg.codebook_learnable,
+        model_dtype=cfg.model_dtype,
+        codebook_dtype=cfg.codebook_dtype,
+        offload_codebook_to_cpu=cfg.offload_codebook_to_cpu,
     )
 
 
@@ -166,11 +174,30 @@ def run_eval_command(args: argparse.Namespace) -> int:
         generator_rank=args.generator_rank,
         metadata_dim=args.metadata_dim,
         codebook_learnable=args.codebook_learnable,
+        model_dtype=args.model_dtype,
+        codebook_dtype=args.codebook_dtype,
+        offload_codebook_to_cpu=args.offload_codebook,
     )
     model_cfg = _build_model_config(cfg)
+    runtime_cfg = TrainingConfig(
+        input_dim=cfg.input_dim,
+        hidden_dim=cfg.hidden_dim,
+        vocab_size=cfg.vocab_size,
+        codebook_size=cfg.codebook_size,
+        generator_embed_dim=cfg.generator_embed_dim,
+        generator_hidden_dim=cfg.generator_hidden_dim,
+        generator_rank=cfg.generator_rank,
+        metadata_dim=cfg.metadata_dim,
+        codebook_learnable=cfg.codebook_learnable,
+        model_dtype=cfg.model_dtype,
+        codebook_dtype=cfg.codebook_dtype,
+        offload_codebook_to_cpu=cfg.offload_codebook_to_cpu,
+    )
 
-    model = ProceduralLanguageModel(model_cfg).to(device)
-    dense = build_dense_baseline(model_cfg).to(device)
+    model = build_model(runtime_cfg, device)
+    first_param = next(model.parameters(), None)
+    model_dtype = first_param.dtype if first_param is not None else torch.float32
+    dense = build_dense_baseline(model_cfg).to(device=device, dtype=model_dtype)
 
     reports: List[dict] = []
     for run in range(args.runs):
@@ -189,7 +216,7 @@ def run_eval_command(args: argparse.Namespace) -> int:
 
     summary = _aggregate_metrics(reports)
     payload = {
-        "config": cfg.__dict__,
+        "config": dataclasses.asdict(runtime_cfg),
         "runs": reports,
         "summary": summary,
         "device": str(device),
@@ -232,6 +259,12 @@ def run_train_command(args: argparse.Namespace) -> int:
         cfg.seed = args.seed
     if args.use_amp is not None:
         cfg.use_amp = bool(args.use_amp)
+    if args.model_dtype is not None:
+        cfg.model_dtype = args.model_dtype
+    if args.codebook_dtype is not None:
+        cfg.codebook_dtype = args.codebook_dtype
+    if args.offload_codebook is not None:
+        cfg.offload_codebook_to_cpu = bool(args.offload_codebook)
     if args.checkpoint_dir is not None:
         cfg.checkpoint_dir = args.checkpoint_dir
     if args.resume is not None:
@@ -310,9 +343,9 @@ def run_chat_command(args: argparse.Namespace) -> int:
             checkpoint_cfg = TrainingConfig(**cfg_dict)
 
     if checkpoint_cfg is not None:
-        cfg = _model_config_from_training(checkpoint_cfg)
+        runtime_cfg = checkpoint_cfg
     else:
-        cfg = ModelCLIConfig(
+        runtime_cfg = TrainingConfig(
             input_dim=args.input_dim,
             hidden_dim=args.hidden_dim,
             vocab_size=args.vocab_size,
@@ -322,15 +355,18 @@ def run_chat_command(args: argparse.Namespace) -> int:
             generator_rank=args.generator_rank,
             metadata_dim=args.metadata_dim,
             codebook_learnable=args.codebook_learnable,
+            model_dtype=args.model_dtype,
+            codebook_dtype=args.codebook_dtype,
+            offload_codebook_to_cpu=args.offload_codebook,
         )
-    model_cfg = _build_model_config(cfg)
-    model = ProceduralLanguageModel(model_cfg)
+    cli_cfg = _model_config_from_training(runtime_cfg)
+    model_cfg = _build_model_config(cli_cfg)
+    model = build_model(runtime_cfg, device)
     if checkpoint_payload is not None:
         state_dict = checkpoint_payload.get("model")
         if state_dict is None:
             raise ValueError("Checkpoint is missing model weights")
         model.load_state_dict(state_dict)
-    model = model.to(device)
 
     print("SPARK chat interface – type /exit to quit.\n")
 
@@ -351,7 +387,7 @@ def run_chat_command(args: argparse.Namespace) -> int:
         if prompt.strip().lower() in {"/exit", "exit", "quit", "q"}:
             break
 
-        metadata = _encode_prompt_metadata(prompt, cfg.metadata_dim, device)
+        metadata = _encode_prompt_metadata(prompt, cli_cfg.metadata_dim, device)
         if supports_generator_delta:
             try:
                 model.apply_generator_delta(metadata)
@@ -363,7 +399,7 @@ def run_chat_command(args: argparse.Namespace) -> int:
         tape = _instructions_from_prompt(prompt)
         trace = model.reason(tape)
 
-        inputs = _encode_prompt_as_tensor(prompt, cfg.input_dim, device)
+        inputs = _encode_prompt_as_tensor(prompt, cli_cfg.input_dim, device)
         logits = model(inputs)
         probs = torch.softmax(logits, dim=-1)
         topk = torch.topk(probs, k=min(args.top_k, probs.size(-1)), dim=-1)
@@ -409,7 +445,7 @@ def run_pipeline_command(args: argparse.Namespace) -> int:
 # Argument parsing
 
 
-def _model_default(value: ModelCLIConfig | None, field: str, fallback: int) -> int:
+def _model_default(value: ModelCLIConfig | None, field: str, fallback):
     return getattr(value, field) if value is not None else fallback
 
 
@@ -427,6 +463,11 @@ def _add_model_arguments(
         default_value = None if as_overrides else _model_default(defaults, field, fallback)
         extra = f" (default: {_model_default(defaults, field, fallback)})" if as_overrides else ""
         parser.add_argument(name, type=int, default=default_value, help=help_text + extra)
+
+    def string_argument(name: str, field: str, fallback: str, help_text: str) -> None:
+        default_value = None if as_overrides else _model_default(defaults, field, fallback)
+        extra = f" (default: {_model_default(defaults, field, fallback)})" if as_overrides else ""
+        parser.add_argument(name, type=str, default=default_value, help=help_text + extra)
 
     numeric_argument("--input-dim", "input_dim", 32, "Dimension of model inputs")
     numeric_argument("--hidden-dim", "hidden_dim", 64, "Hidden size of the model")
@@ -446,6 +487,20 @@ def _add_model_arguments(
         action=argparse.BooleanOptionalAction,
         default=bool_default,
         help="Promote the codebook to a learnable parameter" + bool_extra,
+    )
+    string_argument("--model-dtype", "model_dtype", "auto", "Model parameter dtype")
+    string_argument("--codebook-dtype", "codebook_dtype", "float32", "Codebook dtype")
+    offload_default = None if as_overrides else _bool_default(defaults, "offload_codebook_to_cpu", True)
+    offload_extra = (
+        f" (default: {_bool_default(defaults, 'offload_codebook_to_cpu', True)})"
+        if as_overrides
+        else ""
+    )
+    parser.add_argument(
+        "--offload-codebook",
+        action=argparse.BooleanOptionalAction,
+        default=offload_default,
+        help=("Keep the Demopack codebook on CPU to reduce VRAM usage" + offload_extra),
     )
     device_default = None if as_overrides else None
     parser.add_argument("--device", type=str, default=device_default, help="Device to run on (cpu/cuda)")

@@ -70,6 +70,14 @@ other subcommands along with optimiser knobs such as ``--learning-rate`` and
 via ``--config``; each run emits a JSON summary describing the device, losses
 per epoch, and final checkpoint location.
 
+The CLI now exposes memory-aware flags so the full training pipeline fits on a
+single 16GB GPU by default.  ``--model-dtype`` controls the precision of trainable
+weights, ``--codebook-dtype`` sets the procedural codebook precision, and
+``--offload-codebook/--no-offload-codebook`` toggles CPU offloading for the
+Demopack lookup tables.  The default configuration keeps the codebook on CPU and
+operates the remaining modules in automatic mixed precision, which was validated
+to keep peak VRAM usage under 16GB during the full curriculum.
+
 A quick interactive demo can be executed with Python:
 
 ```python

@@ -38,6 +38,9 @@ class TrainingConfig:
     grad_clip: float = 1.0
     seed: int = 42
     use_amp: bool = True
+    model_dtype: str = "auto"
+    codebook_dtype: str = "float32"
+    offload_codebook_to_cpu: bool = True
     checkpoint_dir: str = "checkpoints"
     resume_from: str | None = None
 
@@ -87,6 +90,29 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
+def _resolve_dtype(name: str, *, device: torch.device, fallback: torch.dtype) -> torch.dtype:
+    """Resolve a torch dtype from a configuration string."""
+
+    normalized = name.strip().lower()
+    if normalized in {"auto", "default"}:
+        return fallback
+    aliases = {
+        "fp32": torch.float32,
+        "float32": torch.float32,
+        "fp16": torch.float16,
+        "float16": torch.float16,
+        "bf16": torch.bfloat16,
+        "bfloat16": torch.bfloat16,
+    }
+    if normalized in aliases:
+        return aliases[normalized]
+    if hasattr(torch, normalized):
+        candidate = getattr(torch, normalized)
+        if isinstance(candidate, torch.dtype):
+            return candidate
+    raise ValueError(f"Unsupported dtype string: {name}")
+
+
 def build_model(cfg: TrainingConfig, device: torch.device) -> ProceduralLanguageModel:
     codebook_spec = CodebookSpec(num_codewords=cfg.codebook_size, embedding_dim=cfg.input_dim)
     generator_cfg = GeneratorConfig(
@@ -104,7 +130,25 @@ def build_model(cfg: TrainingConfig, device: torch.device) -> ProceduralLanguage
         codebook_learnable=cfg.codebook_learnable,
     )
     model = ProceduralLanguageModel(model_cfg)
-    return model.to(device)
+
+    default_model_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    model_dtype = _resolve_dtype(cfg.model_dtype, device=device, fallback=default_model_dtype)
+    codebook_dtype = _resolve_dtype(
+        cfg.codebook_dtype, device=device, fallback=model_dtype
+    )
+
+    model = model.to(device=device, dtype=model_dtype)
+
+    codebook_target_device = device
+    if cfg.offload_codebook_to_cpu and device.type == "cuda":
+        codebook_target_device = torch.device("cpu")
+
+    model.codebook.to(device=codebook_target_device, dtype=codebook_dtype)
+    model.decoder.codebook = model.codebook
+    for module in model.decoder.instructions:
+        module.to(device=codebook_target_device, dtype=codebook_dtype)
+
+    return model
 
 
 def build_dataloaders(cfg: TrainingConfig) -> Tuple[DataLoader, DataLoader]:

@@ -46,8 +46,14 @@ class DemopackCodebook(torch.nn.Module):
     def forward(self, indices: torch.Tensor) -> torch.Tensor:
         if indices.dtype not in (torch.int16, torch.int32, torch.int64):
             raise TypeError("Codebook indices must be an integer tensor")
-        codewords = self.codewords.to(indices.device)
-        return torch.nn.functional.embedding(indices, codewords)
+        codewords = self.codewords
+        original_device = indices.device
+        if original_device != codewords.device:
+            indices = indices.to(codewords.device)
+        embedded = torch.nn.functional.embedding(indices, codewords)
+        if embedded.device != original_device:
+            embedded = embedded.to(original_device, non_blocking=True)
+        return embedded
 
 
 @dataclass
@@ -87,14 +93,15 @@ class DemopackDecoder(torch.nn.Module):
             raise ValueError(
                 f"Input feature dimension mismatch: expected {self.in_features}, got {x.size(-1)}"
             )
-        weight = self._decode_weight(x.device)
+        weight = self._decode_weight(request_device=x.device, request_dtype=x.dtype)
         out = torch.nn.functional.linear(x, weight, self.bias)
         return out
 
-    def _decode_weight(self, device: torch.device) -> torch.Tensor:
+    def _decode_weight(self, *, request_device: torch.device, request_dtype: torch.dtype) -> torch.Tensor:
+        codebook_device = self.codebook.codewords.device
         decoded_tiles = []
         for module in self.instructions:
-            inst = module.to_instruction(device)
+            inst = module.to_instruction(codebook_device)
             decoded = self.codebook(inst.codeword_indices)
             if decoded.size(-1) != self.in_features:
                 raise RuntimeError("Decoded tile width does not match in_features")
@@ -111,6 +118,10 @@ class DemopackDecoder(torch.nn.Module):
         weight = torch.cat(decoded_tiles, dim=0)
         if weight.size(0) != self.out_features:
             raise RuntimeError("Decoded weight rows do not match out_features")
+        if weight.dtype != request_dtype:
+            weight = weight.to(dtype=request_dtype)
+        if weight.device != request_device:
+            weight = weight.to(request_device, non_blocking=True)
         return weight
 
 
