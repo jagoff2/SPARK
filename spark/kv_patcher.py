@@ -26,7 +26,18 @@ class KVCachePatcher:
             entry.dirty = True
 
     def update(self, segment_id: int, key: torch.Tensor, value: torch.Tensor) -> None:
-        self.cache[segment_id] = CacheEntry(key=key, value=value, dirty=False)
+        # ``key`` and ``value`` may participate in an autograd graph produced during
+        # the current forward pass.  If we were to store the tensors directly they
+        # would keep references to that graph which, in turn, would be consulted on
+        # the next training iteration.  Autograd would then observe that we are
+        # trying to backpropagate through the same graph twice and raise an error.
+        # Detaching the cached tensors breaks the graph while preserving the cached
+        # values for future reuse.
+        self.cache[segment_id] = CacheEntry(
+            key=key.detach(),
+            value=value.detach(),
+            dirty=False,
+        )
 
     def gather(self, segment_ids: Iterable[int]) -> Tuple[torch.Tensor, torch.Tensor]:
         keys = []
