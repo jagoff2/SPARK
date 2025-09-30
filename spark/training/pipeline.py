@@ -110,6 +110,9 @@ def _base_frontier_config(seed: int) -> TrainingConfig:
         grad_clip=1.0,
         seed=seed,
         use_amp=True,
+        model_dtype="auto",
+        codebook_dtype="float16",
+        offload_codebook_to_cpu=True,
         checkpoint_dir="checkpoints",
     )
 
@@ -323,6 +326,11 @@ def build_frontier_training_plan(
                 "--metadata-dim",
                 str(base_cfg.metadata_dim),
                 "--codebook-learnable",
+                "--model-dtype",
+                base_cfg.model_dtype,
+                "--codebook-dtype",
+                base_cfg.codebook_dtype,
+                "--offload-codebook",
                 "--batch-size",
                 "64",
                 "--runs",
@@ -367,8 +375,8 @@ def build_frontier_training_plan(
     )
 
     resource_profile = {
-        "accelerators": "8x NVIDIA H100 80GB or higher",
-        "duration_estimate": "~9.5 days wall-clock with ZeRO-3 sharding",
+        "accelerators": "Single NVIDIA-class GPU with >=16GB VRAM (demopack offload to CPU)",
+        "duration_estimate": "~11 days wall-clock with mixed precision and accumulation",
         "dataset_budget": "3.8T tokens total (2.7T pretraining, 0.7T instructions, 0.4T preference)",
         "target_metrics": "Frontier parity defined as <=1.5 nats eval loss and safety win-rate >= 0.95",
     }
