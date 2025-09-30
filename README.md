@@ -49,6 +49,17 @@ Run the unit tests to ensure everything works:
 pytest
 ```
 
+A consolidated CLI is available via ``python -m spark``.  It exposes utilities
+for automated evaluation and a lightweight chat demonstration:
+
+```powershell
+# Run a single evaluation sweep and emit JSON metrics
+python -m spark eval --batch-size 8 --runs 3 --output results.json
+
+# Launch the interactive chat demo (type /exit to quit)
+python -m spark chat --show-trace
+```
+
 A quick interactive demo can be executed with Python:
 
 ```python
