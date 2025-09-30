@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import cycle
 from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
@@ -76,8 +77,11 @@ class DemopackDecoder(torch.nn.Module):
         self.codebook = codebook
         self.out_features = out_features
         self.in_features = in_features
+        normalized_instructions = self._normalize_instructions(
+            instructions, out_features
+        )
         self.instructions = torch.nn.ModuleList()
-        for inst in instructions:
+        for inst in normalized_instructions:
             module = _InstructionBuffer(inst, in_features)
             self.instructions.append(module)
         if bias:
@@ -123,6 +127,56 @@ class DemopackDecoder(torch.nn.Module):
         if weight.device != request_device:
             weight = weight.to(request_device, non_blocking=True)
         return weight
+
+    @staticmethod
+    def _normalize_instructions(
+        instructions: Iterable[DecodeInstruction],
+        out_features: int,
+    ) -> List[DecodeInstruction]:
+        materialized = list(instructions)
+        if not materialized:
+            raise ValueError("DemopackDecoder requires at least one instruction tile")
+
+        normalized: List[DecodeInstruction] = []
+        accumulated = 0
+        for inst in cycle(materialized):
+            if accumulated >= out_features:
+                break
+            rows = int(inst.codeword_indices.size(0))
+            if rows <= 0:
+                raise ValueError("Instruction tiles must include at least one row")
+            remaining = out_features - accumulated
+            if rows > remaining:
+                indices = inst.codeword_indices[:remaining].clone()
+                rotation = None
+                if inst.rotation is not None:
+                    rotation = inst.rotation.clone()
+                inst = DecodeInstruction(
+                    codeword_indices=indices,
+                    scale=inst.scale,
+                    rotation=rotation,
+                )
+            else:
+                inst = _clone_instruction(inst)
+            normalized.append(inst)
+            accumulated += inst.codeword_indices.size(0)
+
+        if accumulated != out_features:
+            raise ValueError(
+                "Decoded instruction tiles cannot be normalised to requested out_features"
+            )
+        return normalized
+
+
+def _clone_instruction(instruction: DecodeInstruction) -> DecodeInstruction:
+    rotation = None
+    if instruction.rotation is not None:
+        rotation = instruction.rotation.clone()
+    return DecodeInstruction(
+        codeword_indices=instruction.codeword_indices.clone(),
+        scale=instruction.scale,
+        rotation=rotation,
+    )
 
 
 class _InstructionBuffer(torch.nn.Module):

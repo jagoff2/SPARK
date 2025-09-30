@@ -23,13 +23,19 @@ import dataclasses
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Union
 
 from .train import TrainingConfig
 
 
 def _slugify(name: str) -> str:
     return "".join(c.lower() if c.isalnum() else "_" for c in name).strip("_")
+
+
+def _normalize_path(path: Union[Path, str]) -> str:
+    if isinstance(path, Path):
+        return path.as_posix()
+    return Path(path).as_posix()
 
 
 @dataclass
@@ -128,7 +134,7 @@ def _phase_config(
     weight_decay: float,
     grad_clip: float,
     use_amp: bool,
-    checkpoint_dir: str,
+    checkpoint_dir: Union[Path, str],
     resume_from: Optional[str],
     seed: int,
 ) -> TrainingConfig:
@@ -142,7 +148,7 @@ def _phase_config(
         weight_decay=weight_decay,
         grad_clip=grad_clip,
         use_amp=use_amp,
-        checkpoint_dir=checkpoint_dir,
+        checkpoint_dir=_normalize_path(checkpoint_dir),
         seed=seed,
     )
     cfg.resume_from = resume_from
@@ -275,12 +281,21 @@ def build_frontier_training_plan(
             weight_decay=spec["weight_decay"],
             grad_clip=spec["grad_clip"],
             use_amp=spec["use_amp"],
-            checkpoint_dir=str(checkpoint_dir),
+            checkpoint_dir=checkpoint_dir,
             resume_from=resume_from,
             seed=seed + index - 1,
         )
         command = _as_command(
-            ["python", "-m", "spark", "train", "--config", str(config_path), "--output", str(output_path)],
+            [
+                "python",
+                "-m",
+                "spark",
+                "train",
+                "--config",
+                _normalize_path(config_path),
+                "--output",
+                _normalize_path(output_path),
+            ],
             _device_argument(device),
         )
         phase = PipelineCommand(
@@ -288,14 +303,14 @@ def build_frontier_training_plan(
             description=spec["objective"],
             command=command,
             config=cfg,
-            config_path=str(config_path),
-            output_path=str(output_path),
-            checkpoint_dir=str(checkpoint_dir),
+            config_path=_normalize_path(config_path),
+            output_path=_normalize_path(output_path),
+            checkpoint_dir=_normalize_path(checkpoint_dir),
             resume_from=resume_from,
             notes=spec.get("notes", []),
         )
         phases.append(phase)
-        resume_from = str(Path(cfg.checkpoint_dir) / "last.pt")
+        resume_from = _normalize_path(Path(cfg.checkpoint_dir) / "last.pt")
 
     eval_output = logs_dir / "evaluation.json"
     evaluation = PipelineCommand(
@@ -340,7 +355,7 @@ def build_frontier_training_plan(
                 "--num-iters",
                 "16",
                 "--output",
-                str(eval_output),
+                _normalize_path(eval_output),
             ],
             _device_argument(device),
         ),
@@ -361,7 +376,7 @@ def build_frontier_training_plan(
                 "spark",
                 "chat",
                 "--checkpoint",
-                str(final_checkpoint),
+                _normalize_path(final_checkpoint),
                 "--top-k",
                 "10",
                 "--show-trace",
