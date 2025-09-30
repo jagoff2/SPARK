@@ -50,15 +50,25 @@ pytest
 ```
 
 A consolidated CLI is available via ``python -m spark``.  It exposes utilities
-for automated evaluation and a lightweight chat demonstration:
+for automated evaluation, a lightweight chat demonstration, and a training
+workflow that produces checkpoints with learnable generator weights:
 
 ```powershell
 # Run a single evaluation sweep and emit JSON metrics
 python -m spark eval --batch-size 8 --runs 3 --output results.json
 
+# Train the procedural model on synthetic data and save metrics
+python -m spark train --epochs 2 --steps-per-epoch 50 --output training.json
+
 # Launch the interactive chat demo (type /exit to quit)
 python -m spark chat --show-trace
 ```
+
+The training command accepts the same architectural hyper-parameters as the
+other subcommands along with optimiser knobs such as ``--learning-rate`` and
+``--grad-clip``.  Custom experiment configurations can also be supplied as JSON
+via ``--config``; each run emits a JSON summary describing the device, losses
+per epoch, and final checkpoint location.
 
 A quick interactive demo can be executed with Python:
 
